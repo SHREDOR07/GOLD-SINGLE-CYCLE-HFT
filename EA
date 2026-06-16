@@ -1,17 +1,17 @@
 //+------------------------------------------------------------------+
-//|                                     GridBreakout_USD_FixedSL.mq5 |
+//|                                  GridBreakout_Final_Precision.mq5|
 //|                                  Copyright 2024, Trading Robot   |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024"
 #property link      ""
-#property version   "1.50"
+#property version   "1.70"
 #property strict
 
 #include <Trade\Trade.mqh>
 
 //--- INPUT PARAMETERS
 input double   InpLots          = 0.01;      // Lot size
-input int      InpGridStep      = 50;        // Distance for pending orders (Points) - CHANGED TO 50
+input int      InpGridStep      = 100;       // Distance for pending orders (Points)
 input double   InpTargetUSD     = 2.00;      // Take Profit in USD
 input double   InpStopLossUSD   = 1.00;      // Stop Loss in USD
 input double   InpBreakEvenUSD  = 1.00;      // Profit in USD to trigger Break Even
@@ -36,15 +36,18 @@ void OnTick()
 {
    int posCount = CountPositions();
 
-   // 1. If a trade is active, manage Break Even and clear pending orders
+   // 1. If a trade is active
    if(posCount > 0)
    {
-      DeleteAllPendingOrders();
-      CheckBreakEven();
+      // Ensure the "other" pending order is removed immediately
+      DeleteAllPendingOrders(); 
+      
+      // Manage the active position (Slippage Correction + Break Even)
+      ManageActiveTrade();
       return; 
    }
 
-   // 2. If no position and no pending orders, place the grid
+   // 2. If no position and no pending orders, place the grid at 100 points
    if(CountPendingOrders() == 0)
    {
       PlaceGridWithTargets();
@@ -52,54 +55,21 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate Price Distance for a specific USD amount               |
+//| Convert USD amount to Price distance                             |
 //+------------------------------------------------------------------+
 double GetPriceDistByUSD(double usdAmount)
 {
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   
-   if(tickValue == 0) return 0;
-   
-   // Formula: Distance = (USD / (Lots * TickValue)) * TickSize
+   if(tickValue <= 0) return 0;
+   // Points = (USD / (Lots * TickValue)) * TickSize
    return (usdAmount / (InpLots * tickValue)) * tickSize;
 }
 
 //+------------------------------------------------------------------+
-//| Place Grid with Hard SL and TP based on USD                      |
+//| Combined Slippage Rectification and Break Even Logic             |
 //+------------------------------------------------------------------+
-void PlaceGridWithTargets()
-{
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   
-   // Calculate the price distances required for $1 loss and $2 profit
-   double slDistance = GetPriceDistByUSD(InpStopLossUSD);
-   double tpDistance = GetPriceDistByUSD(InpTargetUSD);
-   
-   if(slDistance == 0 || tpDistance == 0) return;
-
-   //--- BUY STOP SETUP (50 points above Ask)
-   double buyStopPrice = NormalizeDouble(ask + InpGridStep * _Point, _Digits);
-   double buySL        = NormalizeDouble(buyStopPrice - slDistance, _Digits);
-   double buyTP        = NormalizeDouble(buyStopPrice + tpDistance, _Digits);
-   
-   trade.BuyStop(InpLots, buyStopPrice, _Symbol, buySL, buyTP);
-
-   //--- SELL STOP SETUP (50 points below Bid)
-   double sellStopPrice = NormalizeDouble(bid - InpGridStep * _Point, _Digits);
-   double sellSL         = NormalizeDouble(sellStopPrice + slDistance, _Digits);
-   double sellTP         = NormalizeDouble(sellStopPrice - tpDistance, _Digits);
-
-   trade.SellStop(InpLots, sellStopPrice, _Symbol, sellSL, sellTP);
-   
-   Print("Pending orders placed 50 points from price with SL/TP attached.");
-}
-
-//+------------------------------------------------------------------+
-//| Move Stop Loss to Entry when $1.00 profit is reached             |
-//+------------------------------------------------------------------+
-void CheckBreakEven()
+void ManageActiveTrade()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -108,24 +78,49 @@ void CheckBreakEven()
       {
          if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
          
-         // Calculate net profit including commissions and swap
-         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP) + PositionGetDouble(POSITION_COMMISSION);
-         double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
          double currentSL = PositionGetDouble(POSITION_SL);
+         double currentTP = PositionGetDouble(POSITION_TP);
+         double netProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP) + PositionGetDouble(POSITION_COMMISSION);
          
-         if(profit >= InpBreakEvenUSD)
+         double slDist = GetPriceDistByUSD(InpStopLossUSD);
+         double tpDist = GetPriceDistByUSD(InpTargetUSD);
+         
+         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+         // --- STEP 1: BREAK EVEN LOGIC ($1.00 profit) ---
+         if(netProfit >= InpBreakEvenUSD)
          {
-            // Buy Position: Move SL to Entry
-            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY && currentSL < entry)
+            // If Buy and SL not yet at entry
+            if(type == POSITION_TYPE_BUY && currentSL < openPrice)
             {
-               trade.PositionModify(ticket, entry, PositionGetDouble(POSITION_TP));
-               Print("Break Even: $1 profit reached, SL moved to entry.");
+               trade.PositionModify(ticket, openPrice, currentTP);
+               Print("Break Even: Profit reached $1.00. SL moved to entry.");
+               return; 
             }
-            // Sell Position: Move SL to Entry
-            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL && (currentSL > entry || currentSL == 0))
+            // If Sell and SL not yet at entry
+            if(type == POSITION_TYPE_SELL && (currentSL > openPrice || currentSL == 0))
             {
-               trade.PositionModify(ticket, entry, PositionGetDouble(POSITION_TP));
-               Print("Break Even: $1 profit reached, SL moved to entry.");
+               trade.PositionModify(ticket, openPrice, currentTP);
+               Print("Break Even: Profit reached $1.00. SL moved to entry.");
+               return;
+            }
+         }
+
+         // --- STEP 2: SLIPPAGE RECTIFICATION ---
+         // Only rectify if we haven't moved to Break Even yet
+         bool isAtBreakEven = (MathAbs(currentSL - openPrice) < _Point);
+         
+         if(!isAtBreakEven)
+         {
+            double idealSL = (type == POSITION_TYPE_BUY) ? (openPrice - slDist) : (openPrice + slDist);
+            double idealTP = (type == POSITION_TYPE_BUY) ? (openPrice + tpDist) : (openPrice - tpDist);
+            
+            // If current SL deviates from ideal SL by more than half a point, rectify
+            if(MathAbs(currentSL - idealSL) > _Point * 0.5)
+            {
+               trade.PositionModify(ticket, NormalizeDouble(idealSL, _Digits), NormalizeDouble(idealTP, _Digits));
+               Print("Slippage Rectified: SL/TP adjusted to exact USD distance from actual entry.");
             }
          }
       }
@@ -133,37 +128,56 @@ void CheckBreakEven()
 }
 
 //+------------------------------------------------------------------+
+//| Place initial Pending Orders at 100 points distance              |
+//+------------------------------------------------------------------+
+void PlaceGridWithTargets()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   double slDist = GetPriceDistByUSD(InpStopLossUSD);
+   double tpDist = GetPriceDistByUSD(InpTargetUSD);
+   
+   if(slDist <= 0 || tpDist <= 0) return;
+
+   // Buy Stop: 100 points above Ask
+   double buyPrice = NormalizeDouble(ask + InpGridStep * _Point, _Digits);
+   double buySL    = NormalizeDouble(buyPrice - slDist, _Digits);
+   double buyTP    = NormalizeDouble(buyPrice + tpDist, _Digits);
+   trade.BuyStop(InpLots, buyPrice, _Symbol, buySL, buyTP);
+
+   // Sell Stop: 100 points below Bid
+   double sellPrice = NormalizeDouble(bid - InpGridStep * _Point, _Digits);
+   double sellSL     = NormalizeDouble(sellPrice + slDist, _Digits);
+   double sellTP     = NormalizeDouble(sellPrice - tpDist, _Digits);
+   trade.SellStop(InpLots, sellPrice, _Symbol, sellSL, sellTP);
+   
+   Print("Pending Orders placed 100 points from market.");
+}
+
+//+------------------------------------------------------------------+
 //| Helper Functions                                                 |
 //+------------------------------------------------------------------+
-int CountPositions()
-{
-   int count = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
+int CountPositions() {
+   int c = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
       if(PositionSelectByTicket(PositionGetTicket(i)))
-         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) count++;
-   }
-   return count;
+         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) c++;
+   return c;
 }
 
-int CountPendingOrders()
-{
-   int count = 0;
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
+int CountPendingOrders() {
+   int c = 0;
+   for(int i = OrdersTotal()-1; i >= 0; i--)
       if(OrderSelect(OrderGetTicket(i)))
-         if(OrderGetInteger(ORDER_MAGIC) == InpMagicNumber) count++;
-   }
-   return count;
+         if(OrderGetInteger(ORDER_MAGIC) == InpMagicNumber) c++;
+   return c;
 }
 
-void DeleteAllPendingOrders()
-{
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = OrderGetTicket(i);
-      if(OrderSelect(ticket))
-         if(OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
-            trade.OrderDelete(ticket);
+void DeleteAllPendingOrders() {
+   for(int i = OrdersTotal()-1; i >= 0; i--) {
+      ulong t = OrderGetTicket(i);
+      if(OrderSelect(t) && OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
+         trade.OrderDelete(t);
    }
 }
